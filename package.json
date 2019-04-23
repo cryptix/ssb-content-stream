@@ -9,7 +9,11 @@
   "author": "Fraction",
   "license": "ISC",
   "devDependencies": {
+    "debug": "^4.1.1",
+    "ssb-blob-content": "^0.4.0",
     "ssb-blobs": "^1.1.15",
+    "ssb-db": "^19.1.1",
+    "ssb-keys": "^7.1.5",
     "ssb-server": "^14.1.12",
     "tape": "^4.10.1"
   },
