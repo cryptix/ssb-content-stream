@@ -1,38 +1,42 @@
 const pkg = require('./package.json')
 const pull = require('pull-stream')
+const pullDrain = require('pull-stream/sinks/drain')
 const pullCat = require('pull-cat')
+const pCont = require('pull-cont/source')
 const crypto = require('crypto')
 const level = require('level')
 const path = require('path')
 const lodash = require('lodash')
 
-const safe64 = (s) => {
-  return s.replace('+', '-').replace('/', '_')
-}
+// i would drop the .box (since it's not encrypted)
+// but doing so would requier a breaking change to ssb-validate
+const contentSuffix = '.box.offchain.sha256'
 
 const isContentMessage = (msg) => {
+  if (msg === null) {
+    return false
+  }
+
   // Make sure `content` is an object.
-  if (typeof msg.value.content !== 'object') {
+  if (typeof msg.value.content !== 'string') {
     return false
   }
 
   // Make sure this is a content message.
-  if (msg.value.content.type !== 'content') {
+  if (msg.value.content.endsWith(contentSuffix) === false) {
     return false
   }
 
-  if (msg.value.content.href.startsWith('ssb:content:sha256') === false) {
-    return false
-  }
+  return true
 }
 
 const getContentHref = (msg) =>
-  isContentMessage(msg) ? msg.value.content.href : null
+  isContentMessage(msg) ? msg.value.content : null
 
 const createHref = (str) => {
   const hash = crypto.createHash('sha256').update(str)
-  const digest = safe64(hash.digest('base64'))
-  return `ssb:content:sha256:${digest}`
+  const digest = hash.digest('base64')
+  return digest + contentSuffix
 }
 
 exports.init = (ssb, config) => {
@@ -41,22 +45,14 @@ exports.init = (ssb, config) => {
   const contentStream = {
     // Returns `createHistoryStream()` with off-chain content added inline.
     //
-    // Each message is searched for the follwing pattern:
-    //
-    // ```javascript
-    // {
-    //   type: 'content',
-    //   href: `ssb:content:sha256:${hash}`
-    // }
-    // ```
-    //
     // Items that pass the pattern are pulled from the database and prepended
     // to the stream so that they don't bottleneck the indexing process.
+    // cryptix: I don't think this will perform well for replication. we can't buffer that many messages.
+    // It would be besser to transfer them as [meta:content] pairs and process them directly
     createSource: (opts) => pullCat([
       pull(
         ssb.createHistoryStream(opts),
         pull.map(getContentHref),
-        pull.filter(),
         pull.unique(),
         pull.asyncMap(db.get)
       ),
@@ -76,6 +72,7 @@ exports.init = (ssb, config) => {
 
       return pull(
         pull.map(val => {
+          console.log(val)
           // If the item is a content string we add it to the `contentMap`
           // object for processing later.
           if (typeof val === 'string') {
@@ -86,7 +83,6 @@ exports.init = (ssb, config) => {
 
           return val
         }),
-        pull.filter(),
         pull.through((msg) => {
           // Now we take each message and check whether it's in `contentMap`.
           const href = getContentHref(msg)
@@ -114,7 +110,7 @@ exports.init = (ssb, config) => {
         return cb(null, msg)
       }
 
-      db.get(msg.value.content.href, (err, val) => {
+      db.get(msg.value.content, (err, val) => {
         if (err) return cb(err, msg)
 
         lodash.set(msg, 'value.meta.original.content', msg.value.content)
@@ -122,6 +118,7 @@ exports.init = (ssb, config) => {
         cb(null, msg)
       })
     },
+
     // Same API as calling `createHistoryStream()` except that it returns the
     // off-chain content instead of just the metadata.
     getContentStream: (opts) => pull(
@@ -129,23 +126,49 @@ exports.init = (ssb, config) => {
       contentStream.createHandler(),
       pull.asyncMap(contentStream.getContent)
     ),
+
     // Takes message value and posts it to your feed as off-chain content.
     publish: (content, cb) => {
       const str = JSON.stringify(content)
       const href = createHref(str)
-      const msg = {
-        href,
-        mediaType: 'text/json',
-        type: 'content'
-      }
+      
       db.put(href, str, (err) => {
         if (err) return cb(err)
-        originalPublish(msg, cb)
+        // might want to wrap ssb.add and somehow trigger indexing of content that way?!
+        // no, add is a even more low-level.
+        // publish is a wrapper around ssb-feed which adds author and the next timestamp, so: no.
+        // i think what we need is another unboxer-like map?!
+        // but i'm not sure we can influence oder?
+        //  which seems silly since it would be important if this is supposed to be generic
+        ssb.publish(href, cb)
       })
     }
   }
 
+  // error if offchain to prompt use of contentStream?!
+  // ssb.createHistoryStream.hook((fn, args) => {
+  //   var self = this
+  //   return pCont(function (cb) {
+  //     pull(
+  //       // pluck the first message of the feed to see if it is
+  //       fn.apply(self, {id:args.id, limit:1}),
+  //       pullDrain((msg) => {
+  //         if (isContentMessage(msg)) {
+  //           cb(new Error("content-stream: use appropriate handler"))
+  //           return
+  //         }
+  //         // pass through if it isnt
+  //         cb(null, pull(
+  //           fn.apply(self, args)
+  //         ))
+  //       })  
+  //     )
+  //   })
+  // })
+
+
   // XXX: is this a bad idea? we want to keep clients from publishing inline content
+  // cryptix: maybe. for one, it breaks indexing of plugins like friends
   const originalPublish = ssb.publish
   // ssb.publish = contentStream.publish
 
@@ -156,8 +179,9 @@ exports.init = (ssb, config) => {
 }
 
 exports.manifest = {
+  publish: 'async',
   createSource: 'source',
-  createBlobHandler: 'source'
+  getContentStream: 'source'
 }
 
 exports.permissions = [ 'createSource' ]
